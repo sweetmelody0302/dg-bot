@@ -33,20 +33,53 @@ app.post('/webhook', async (req, res) => {
                 const difyRes = await axios.post(`${DIFY_API_URL}/chat-messages`, {
                     inputs: {},
                     query: event.message.text,
-                    response_mode: "blocking",
-                    // CTO 微調：移除 conversation_id，避免 Dify 新版 API 嚴格檢查報錯
+                    response_mode: "streaming", // CTO 修正：Agent 必須使用 streaming (串流) 模式
                     user: event.source.userId // 用 LINE UID 區分不同客人
                 }, {
                     headers: { 
                         'Authorization': `Bearer ${DIFY_API_KEY}`, 
                         'Content-Type': 'application/json' 
-                    }
+                    },
+                    responseType: 'stream' // 告訴 Axios 我們要接收串流資料
                 });
 
-                // 將 Dify 大腦的回答，回傳給 LINE 用戶
+                // 收集 Dify 像打字機一樣吐出來的每一個字
+                const fullAnswer = await new Promise((resolve, reject) => {
+                    let answer = '';
+                    let buffer = '';
+                    difyRes.data.on('data', (chunk) => {
+                        buffer += chunk.toString();
+                        let boundary = buffer.indexOf('\n');
+                        while (boundary !== -1) {
+                            let line = buffer.slice(0, boundary).trim();
+                            buffer = buffer.slice(boundary + 1);
+                            if (line.startsWith('data: ')) {
+                                try {
+                                    let data = JSON.parse(line.slice(6));
+                                    // Agent 專屬的事件名稱，把 answer 碎片拼起來
+                                    if ((data.event === 'agent_message' || data.event === 'message') && data.answer) {
+                                        answer += data.answer;
+                                    }
+                                } catch (e) {
+                                    // 忽略不完整的 JSON 碎片
+                                }
+                            }
+                            boundary = buffer.indexOf('\n');
+                        }
+                    });
+                    difyRes.data.on('end', () => resolve(answer));
+                    difyRes.data.on('error', (err) => reject(err));
+                });
+
+                if (!fullAnswer) {
+                    console.log("Dify 回傳空字串，可能是 RAG 知識庫沒有命中");
+                    return; // 避免傳送空訊息給 LINE 導致報錯
+                }
+
+                // 將拼好的完整回答，回傳給 LINE 用戶
                 await axios.post('https://api.line.me/v2/bot/message/reply', {
                     replyToken: event.replyToken,
-                    messages: [{ type: 'text', text: difyRes.data.answer }]
+                    messages: [{ type: 'text', text: fullAnswer }]
                 }, {
                     headers: { 
                         'Content-Type': 'application/json', 
