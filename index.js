@@ -18,6 +18,23 @@ const GAS_URL = process.env.GAS_URL;
 const DIFY_API_URL = 'https://api.dify.ai/v1'; 
 
 // ==========================================
+// 🌟 【全新小幫手】將對話紀錄傳送至 Google Sheets 雲端儲存
+// ==========================================
+async function saveChatToCloud(uid, sender, text) {
+    if (!GAS_URL) return; // 如果沒設定 GAS 網址就不執行
+    try {
+        await axios.post(GAS_URL, {
+            action: "save_chat", // 告訴 GAS 這是要存對話的指令
+            lineUid: uid,
+            sender: sender,
+            message: text
+        }, { headers: { 'Content-Type': 'application/json' } });
+    } catch (e) {
+        console.error("儲存對話失敗:", e.message);
+    }
+}
+
+// ==========================================
 // 1. 接收 LINE 官方帳號的訊息，轉發給 Dify (AI 顧問對話)
 // ==========================================
 app.post('/webhook', async (req, res) => {
@@ -30,12 +47,18 @@ app.post('/webhook', async (req, res) => {
     for (const event of events) {
         if (event.type === 'message' && event.message.type === 'text') {
             try {
+                const uid = event.source.userId;
+                const userText = event.message.text;
+
+                // 🌟 紀錄客戶說的話到 Google Sheets
+                saveChatToCloud(uid, "客戶", userText);
+
                 // 打給 Dify 大腦 (使用串流模式 Streaming)
                 const difyRes = await axios.post(`${DIFY_API_URL}/chat-messages`, {
                     inputs: {},
-                    query: event.message.text,
+                    query: userText,
                     response_mode: "streaming", 
-                    user: event.source.userId 
+                    user: uid 
                 }, {
                     headers: { 
                         'Authorization': `Bearer ${DIFY_API_KEY}`, 
@@ -71,6 +94,9 @@ app.post('/webhook', async (req, res) => {
 
                 if (!fullAnswer) return;
 
+                // 🌟 紀錄 AI 說的話到 Google Sheets
+                saveChatToCloud(uid, "AI 顧問", fullAnswer);
+
                 // 回傳給 LINE 客戶
                 await axios.post('https://api.line.me/v2/bot/message/reply', {
                     replyToken: event.replyToken,
@@ -95,7 +121,7 @@ app.post('/api/submit-inquiry', async (req, res) => {
     res.status(200).json({ success: true, message: "資料已接收" });
     const { lineUid, lineName, company, contactName, painpoints, budget } = req.body;
 
-    // 寫入 Google Sheets
+    // 寫入 Google Sheets (詢價名單)
     if (GAS_URL) {
         axios.post(GAS_URL, req.body, { headers: { 'Content-Type': 'application/json' } })
              .catch(err => console.error("GAS 寫入失敗:", err.message));
@@ -115,6 +141,10 @@ app.post('/api/submit-inquiry', async (req, res) => {
                     'Authorization': `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` 
                 }
             });
+            
+            // 🌟 紀錄系統主動發送的回執信
+            saveChatToCloud(lineUid, "系統自動推播", "✅ 已發送需求確認回執信給客戶");
+            
             console.log("回執訊息已成功發送給 UID:", lineUid);
         } catch (error) {
             console.error("回傳明細失敗:", error.response ? JSON.stringify(error.response.data) : error.message);
@@ -123,7 +153,7 @@ app.post('/api/submit-inquiry', async (req, res) => {
 });
 
 // ==========================================
-// 3. 【全新升級】提供 CRM 儀表板抓取客戶名單
+// 3. 提供 CRM 儀表板抓取「客戶名單」
 // ==========================================
 app.get('/api/inquiries', async (req, res) => {
     if (!GAS_URL) {
@@ -131,7 +161,6 @@ app.get('/api/inquiries', async (req, res) => {
     }
     
     try {
-        // 大腦向 Google Sheets 討資料，轉交給您的前端網頁
         const response = await axios.get(GAS_URL);
         res.status(200).json(response.data);
     } catch (error) {
@@ -141,7 +170,24 @@ app.get('/api/inquiries', async (req, res) => {
 });
 
 // ==========================================
-// 4. 【全新升級】提供 CRM 儀表板「一鍵回覆」功能
+// 🌟 【全新功能】提供 CRM 儀表板讀取特定客戶的「完整雲端對話紀錄」
+// ==========================================
+app.get('/api/chat-history', async (req, res) => {
+    const { uid } = req.query;
+    if (!GAS_URL || !uid) return res.status(400).json({ success: false, message: "缺少必要參數" });
+    
+    try {
+        // 向 GAS 請求該 UID 的專屬歷史對話 (帶上 action=get_chat 參數)
+        const response = await axios.get(`${GAS_URL}?action=get_chat&uid=${uid}`);
+        res.status(200).json(response.data);
+    } catch (error) {
+        console.error("讀取歷史對話失敗:", error.message);
+        res.status(500).json({ success: false, message: "讀取歷史對話失敗" });
+    }
+});
+
+// ==========================================
+// 4. 提供 CRM 儀表板「一鍵回覆」功能
 // ==========================================
 app.post('/api/reply', async (req, res) => {
     const { lineUid, message } = req.body;
@@ -162,10 +208,12 @@ app.post('/api/reply', async (req, res) => {
             }
         });
         
+        // 🌟 紀錄老闆親自說的話到 Google Sheets
+        saveChatToCloud(lineUid, "老闆 (官方)", message);
+        
         console.log(`老闆已成功從儀表板發送訊息給: ${lineUid}`);
         res.status(200).json({ success: true, message: "訊息已成功發送至客戶 LINE" });
     } catch (error) {
-        // 如果這個月推播 (Push) 額度滿了，或是 UID 錯誤，會在這裡報錯
         console.error("發送回覆失敗:", error.response ? JSON.stringify(error.response.data) : error.message);
         res.status(500).json({ success: false, message: "發送失敗，請檢查 LINE OA 推播額度或 UID" });
     }
